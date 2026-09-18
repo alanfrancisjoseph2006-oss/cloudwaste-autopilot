@@ -1,0 +1,206 @@
+# CloudWaste Autopilot default policy set.
+#
+# Read this file as the answer to one question: what is CloudWaste allowed to
+# do without asking? The default answer is "almost nothing", and that is
+# deliberate. Rules are evaluated in priority order, lowest number first, and
+# any matching `deny` beats every `allow`.
+#
+# Criteria left unset match anything. So a rule with only `environment:
+# production` matches every action on every production resource, which is why
+# the protection rules below are written that way and the permissive ones are
+# written narrowly.
+#
+# Even a rule with auto_execute: true cannot run unattended unless the
+# deployment has autopilot_enabled=true and the action's risk is at or below
+# autopilot_max_risk. A policy file cannot grant itself more authority than the
+# deployment allows.
+
+rules:
+
+  # ====================================================================
+  # PROTECTION RULES (priority 0-19). These deny. Nothing overrides them.
+  # ====================================================================
+
+  - name: never-touch-production-unattended
+    description: >-
+      Production resources always require a human. Production is where an
+      incorrect action costs money that dwarfs anything this tool saves.
+    priority: 0
+    environment: production
+    effect: deny
+    auto_execute: false
+    require_approval: true
+
+  - name: never-touch-high-criticality
+    description: >-
+      Anything the owner marked high-criticality requires a human, whatever
+      environment tag it carries.
+    priority: 1
+    criticality: high
+    effect: deny
+    auto_execute: false
+    require_approval: true
+
+  - name: never-delete-databases-unattended
+    description: >-
+      No automated path exists to delete or resize a database without approval.
+      The blast radius is every application holding a connection.
+    priority: 2
+    resource_type: RDS
+    effect: deny
+    auto_execute: false
+    require_approval: true
+
+  - name: never-release-elastic-ips-unattended
+    description: >-
+      Releasing a public IPv4 address is irreversible -- AWS does not guarantee
+      you can allocate the same address again -- and external systems routinely
+      allow-list addresses without telling the account owner.
+    priority: 3
+    action: RELEASE_ELASTIC_IP
+    effect: deny
+    auto_execute: false
+    require_approval: true
+
+  - name: never-touch-untagged-resources-unattended
+    description: >-
+      An untagged resource has no verifiable owner or environment. The risk
+      engine already treats unknown environments as production; this makes the
+      same judgement explicit in policy so it survives a risk-engine change.
+    priority: 4
+    environment: unknown
+    effect: deny
+    auto_execute: false
+    require_approval: true
+
+  # Note on confidence: there is no global "deny below N% confidence" rule,
+  # because `min_confidence` on a rule matches at-or-above a threshold and
+  # cannot express a ceiling. The floor is enforced instead by putting
+  # min_confidence on every permissive rule below, so a low-confidence action
+  # matches none of them and falls through to "no rule authorizes this",
+  # which requires approval.
+
+  # ====================================================================
+  # PERMISSIVE RULES (priority 50+). Narrow, reversible, low-value-at-risk.
+  # ====================================================================
+
+  - name: dev-ebs-gp2-to-gp3
+    description: >-
+      Converting gp2 to gp3 is the safest saving in AWS: online, no downtime,
+      no performance loss at this volume's observed IOPS, and reversible by the
+      same call. Allowed unattended in development.
+    priority: 50
+    resource_type: EBS
+    environment: development
+    action: MODIFY_EBS_VOLUME_TYPE
+    max_risk: low
+    min_confidence: 85
+    effect: allow
+    auto_execute: true
+    require_approval: false
+
+  - name: test-ebs-gp2-to-gp3
+    description: Same as dev-ebs-gp2-to-gp3, for test environments.
+    priority: 51
+    resource_type: EBS
+    environment: test
+    action: MODIFY_EBS_VOLUME_TYPE
+    max_risk: low
+    min_confidence: 85
+    effect: allow
+    auto_execute: true
+    require_approval: false
+
+  - name: dev-ec2-auto-stop-idle
+    description: >-
+      Stopping an idle development instance is fully reversible and recovers
+      the entire compute charge. Requires LOW risk, which in practice means the
+      instance is tagged development, has a rollback path, and carries high
+      confidence.
+    priority: 52
+    resource_type: EC2
+    environment: development
+    action: STOP_EC2
+    max_risk: low
+    min_confidence: 90
+    effect: allow
+    auto_execute: true
+    require_approval: false
+
+  - name: dev-unattached-volume-cleanup
+    description: >-
+      Deleting an unattached development volume that already has a current
+      snapshot. The snapshot requirement is enforced independently by the risk
+      engine, which blocks any destructive action on data with no backup.
+    priority: 53
+    resource_type: EBS
+    environment: development
+    action: DELETE_EBS
+    max_risk: low
+    min_confidence: 90
+    max_monthly_savings: 200
+    effect: allow
+    auto_execute: true
+    require_approval: false
+
+  # ====================================================================
+  # APPROVAL RULES (priority 100+). Allowed, but a human must say yes.
+  # ====================================================================
+
+  - name: dev-rightsizing-with-approval
+    description: >-
+      Resizing a development instance needs a restart, so someone should know
+      it is coming even though the environment is non-critical.
+    priority: 100
+    resource_type: EC2
+    environment: development
+    action: RESIZE_EC2
+    effect: allow
+    auto_execute: false
+    require_approval: true
+    approval_ttl_hours: 72
+
+  - name: staging-changes-with-approval
+    description: Staging mirrors production closely enough to warrant a human.
+    priority: 101
+    environment: staging
+    effect: allow
+    auto_execute: false
+    require_approval: true
+    approval_ttl_hours: 48
+
+  - name: s3-lifecycle-with-approval
+    description: >-
+      Lifecycle rules are low-risk and removable, but they change retrieval
+      economics for whoever reads the bucket, so the owner should agree.
+    priority: 102
+    resource_type: S3
+    action: CREATE_S3_LIFECYCLE_POLICY
+    effect: allow
+    auto_execute: false
+    require_approval: true
+    approval_ttl_hours: 168
+
+  - name: lambda-memory-with-approval
+    description: >-
+      No downtime, but less memory means less CPU, so the owning team should
+      confirm the latency change is acceptable.
+    priority: 103
+    resource_type: LAMBDA
+    action: MODIFY_LAMBDA_MEMORY
+    effect: allow
+    auto_execute: false
+    require_approval: true
+    approval_ttl_hours: 168
+
+  - name: catch-all-requires-approval
+    description: >-
+      Anything not matched above. Present for clarity only -- the engine
+      already treats "no matching rule" as requiring approval, so this rule
+      changes nothing. It exists so that reading the file tells you the whole
+      story without knowing the engine's default.
+    priority: 999
+    effect: allow
+    auto_execute: false
+    require_approval: true
+    approval_ttl_hours: 72

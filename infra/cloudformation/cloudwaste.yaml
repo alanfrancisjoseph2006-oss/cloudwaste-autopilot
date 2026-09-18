@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudWaste Autopilot v1.0 - storage, notifications, scheduling and the
+  remediation state machine role. Deploy this in the account that RUNS
+  CloudWaste; deploy customer-account.yaml in each account it reads.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  TablePrefix:
+    Type: String
+    Default: CloudWaste
+  AutopilotEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Master switch for unattended execution. Left false, every action requires
+      human approval regardless of what the policy file says. Turning this on is
+      a deliberate decision, which is why it is a stack parameter and not a
+      config file default.
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      While true, executors run every phase except the AWS mutation itself.
+  EscalationEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      Address paged when an action fails AND its rollback fails. Leave empty to
+      skip the subscription, but note that this is the one alarm that matters.
+
+Conditions:
+  HasEscalationEmail: !Not [!Equals [!Ref EscalationEmail, ""]]
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Resources:
+
+  # ====================================================================
+  # Storage
+  # ====================================================================
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Accounts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: account_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ResourcesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Resources"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resource_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resource_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  FindingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Findings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: finding_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: finding_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  RecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Recommendations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendation_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendation_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  ActionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Actions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: action_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: action_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  AuditLogsTable:
+    Type: AWS::DynamoDB::Table
+    # Retained on stack deletion: the audit trail is the record of what this
+    # system did to someone's infrastructure and must outlive the stack.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${TablePrefix}AuditLogs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: audit_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: audit_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ScansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Scans"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scan_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scan_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_account
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "cloudwaste-reports-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # CloudWaste recommends lifecycle rules to its users, so its own
+          # bucket has one.
+          - Id: transition-old-reports
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 365
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ====================================================================
+  # Notifications
+  # ====================================================================
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cloudwaste-notifications-${Environment}"
+      DisplayName: CloudWaste remediation notifications
+
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cloudwaste-escalation-${Environment}"
+      DisplayName: CloudWaste escalation (action failed AND rollback failed)
+
+  EscalationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEscalationEmail
+    Properties:
+      TopicArn: !Ref EscalationTopic
+      Protocol: email
+      Endpoint: !Ref EscalationEmail
+
+  # ====================================================================
+  # IAM
+  # ====================================================================
+
+  RemediationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cloudwaste-remediation-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, states.amazonaws.com]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cloudwaste-data-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt AccountsTable.Arn
+                  - !GetAtt ResourcesTable.Arn
+                  - !GetAtt FindingsTable.Arn
+                  - !GetAtt RecommendationsTable.Arn
+                  - !GetAtt ActionsTable.Arn
+                  - !GetAtt ScansTable.Arn
+                  - !Sub "${ResourcesTable.Arn}/index/*"
+                  - !Sub "${FindingsTable.Arn}/index/*"
+                  - !Sub "${RecommendationsTable.Arn}/index/*"
+                  - !Sub "${ActionsTable.Arn}/index/*"
+                  - !Sub "${ScansTable.Arn}/index/*"
+              # Audit records are append-only: no UpdateItem, no DeleteItem.
+              # Nothing in this system is permitted to rewrite history.
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt AuditLogsTable.Arn
+                  - !Sub "${AuditLogsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "${ReportsBucket.Arn}/*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: [!Ref NotificationTopic, !Ref EscalationTopic]
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+        - PolicyName: cloudwaste-assume-customer-roles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/CloudWasteAutopilotRole"
+                Condition:
+                  StringEquals:
+                    sts:ExternalId: !Sub "cloudwaste-${AWS::AccountId}"
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cloudwaste-statemachine-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-and-notify
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cloudwaste-*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: [!Ref NotificationTopic, !Ref EscalationTopic]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/cloudwaste-remediation-${Environment}"
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # ====================================================================
+  # Scheduling
+  # ====================================================================
+
+  DailyScanSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cloudwaste-daily-scan-${Environment}"
+      Description: >-
+        Daily scan. Runs after 06:00 UTC so that the previous day's Cost
+        Explorer data has settled; scanning earlier reads an incomplete day and
+        produces savings figures that change under you.
+      ScheduleExpression: "cron(0 7 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: scan
+          Arn: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cloudwaste-scan"
+          Input: !Sub '{"mode": "scheduled", "environment": "${Environment}"}'
+
+  ApprovalExpirySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cloudwaste-approval-expiry-${Environment}"
+      Description: >-
+        Hourly sweep that expires approvals past their TTL, so a stale approval
+        never sits waiting to be executed against an account that has moved on.
+      ScheduleExpression: "rate(1 hour)"
+      State: ENABLED
+      Targets:
+        - Id: expire
+          Arn: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cloudwaste-expire-approvals"
+
+Outputs:
+  AutopilotEnabled:
+    Description: >-
+      Whether unattended execution is permitted. When false, every action
+      requires human approval regardless of policy.
+    Value: !Ref AutopilotEnabled
+  DryRun:
+    Value: !Ref DryRun
+  RemediationRoleArn:
+    Value: !GetAtt RemediationExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RemediationRoleArn"
+  StateMachineRoleArn:
+    Value: !GetAtt StateMachineRole.Arn
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+  EscalationTopicArn:
+    Value: !Ref EscalationTopic
+  ReportsBucketName:
+    Value: !Ref ReportsBucket
+  ExternalId:
+    Description: Pass this to customer-account.yaml in each scanned account.
+    Value: !Sub "cloudwaste-${AWS::AccountId}"

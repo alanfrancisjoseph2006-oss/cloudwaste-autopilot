@@ -1,0 +1,369 @@
+{
+  "Comment": "CloudWaste Autopilot remediation state machine. Mirrors cloudwaste/actions/orchestrator.py state for state: the local orchestrator and this definition must stay in lockstep, because what is tested locally is what runs here. Every terminal path writes an audit record, and a rollback failure is escalated rather than flattened into a generic failure.",
+  "StartAt": "ValidateAction",
+  "TimeoutSeconds": 5400,
+  "States": {
+    "ValidateAction": {
+      "Type": "Task",
+      "Resource": "${ValidateActionFunctionArn}",
+      "Comment": "Confirms an executor exists for this action type and that the action targets the resource it claims to.",
+      "ResultPath": "$.validation",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        }
+      ],
+      "Next": "ValidatePolicy"
+    },
+
+    "ValidatePolicy": {
+      "Type": "Task",
+      "Resource": "${ValidatePolicyFunctionArn}",
+      "Comment": "Re-evaluates policy and approval at execution time. An approval granted days ago may have expired, and the policy file may have changed since.",
+      "ResultPath": "$.policy",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        }
+      ],
+      "Next": "IsExecutionAllowed"
+    },
+
+    "IsExecutionAllowed": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.policy.allowed",
+          "BooleanEquals": true,
+          "Next": "Preflight"
+        }
+      ],
+      "Default": "AuditAborted"
+    },
+
+    "Preflight": {
+      "Type": "Task",
+      "Resource": "${PreflightFunctionArn}",
+      "Comment": "Re-reads live AWS state and refuses if the world changed since the recommendation was produced: the volume was reattached, the instance was re-tagged production, the database now has pending modifications. This is the state that prevents acting on a stale picture of the account.",
+      "ResultPath": "$.preflight",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "Comment": "Retries transient AWS read errors only. PreflightFailure is a distinct error type and is not retried."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["PreflightFailure"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        }
+      ],
+      "Next": "CaptureBaseline"
+    },
+
+    "CaptureBaseline": {
+      "Type": "Task",
+      "Resource": "${CaptureBaselineFunctionArn}",
+      "Comment": "Records pre-change CloudWatch health so that 'worse' has a meaning afterwards. Verification compares against this, not against an absolute threshold.",
+      "ResultPath": "$.baseline",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        }
+      ],
+      "Next": "CreateCheckpoint"
+    },
+
+    "CreateCheckpoint": {
+      "Type": "Task",
+      "Resource": "${CreateCheckpointFunctionArn}",
+      "Comment": "Captures the state needed to undo this action, including creating a snapshot where the action is destructive. If this fails, nothing is executed.",
+      "ResultPath": "$.checkpoint",
+      "TimeoutSeconds": 1800,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "AuditAborted"
+        }
+      ],
+      "Next": "ExecuteAction"
+    },
+
+    "ExecuteAction": {
+      "Type": "Task",
+      "Resource": "${ExecuteActionFunctionArn}",
+      "Comment": "The only state that mutates AWS. Not retried: a partially applied mutation must go to rollback rather than be attempted again, because retrying a half-completed resize is how an instance ends up stopped and unstartable.",
+      "ResultPath": "$.execution",
+      "TimeoutSeconds": 1800,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Rollback"
+        }
+      ],
+      "Next": "Settle"
+    },
+
+    "Settle": {
+      "Type": "Wait",
+      "Comment": "Lets the resource stabilize before its metrics are believed. Duration is set per resource type by the ExecuteAction step (EC2 300s, RDS 600s, Lambda 900s because it needs invocations at the new size).",
+      "SecondsPath": "$.execution.settle_seconds",
+      "Next": "VerifyHealth"
+    },
+
+    "VerifyHealth": {
+      "Type": "Task",
+      "Resource": "${VerifyHealthFunctionArn}",
+      "Comment": "Confirms the change took effect and the resource is no worse than its baseline. Cost is deliberately NOT verified here: AWS billing lags by up to 24 hours, so a cost check now would fail for every successful action.",
+      "ResultPath": "$.verification",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Rollback"
+        }
+      ],
+      "Next": "DidVerificationPass"
+    },
+
+    "DidVerificationPass": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.verification.passed",
+          "BooleanEquals": true,
+          "Next": "RecordSavings"
+        }
+      ],
+      "Default": "Rollback"
+    },
+
+    "RecordSavings": {
+      "Type": "Task",
+      "Resource": "${RecordSavingsFunctionArn}",
+      "Comment": "Writes the realized saving and schedules the deferred cost reconciliation for once Cost Explorer reflects the change.",
+      "ResultPath": "$.savings",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "AuditSuccess"
+    },
+
+    "Rollback": {
+      "Type": "Task",
+      "Resource": "${RollbackFunctionArn}",
+      "Comment": "Restores the captured checkpoint. Note that for a deleted volume this creates a NEW volume from the snapshot with a new id: recovery, not undo.",
+      "ResultPath": "$.rollback",
+      "TimeoutSeconds": 1800,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.rollbackError",
+          "Next": "AuditRollbackFailed"
+        }
+      ],
+      "Next": "DidRollbackSucceed"
+    },
+
+    "DidRollbackSucceed": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.rollback.succeeded",
+          "BooleanEquals": true,
+          "Next": "AuditRolledBack"
+        }
+      ],
+      "Default": "AuditRollbackFailed"
+    },
+
+    "AuditSuccess": {
+      "Type": "Task",
+      "Resource": "${AuditFunctionArn}",
+      "Parameters": {
+        "action.$": "$.action",
+        "outcome": "SUCCESS",
+        "event": "action.completed",
+        "detail.$": "$"
+      },
+      "ResultPath": "$.audit",
+      "Next": "NotifySuccess"
+    },
+
+    "AuditRolledBack": {
+      "Type": "Task",
+      "Resource": "${AuditFunctionArn}",
+      "Parameters": {
+        "action.$": "$.action",
+        "outcome": "ROLLED_BACK",
+        "event": "action.rolled_back",
+        "detail.$": "$"
+      },
+      "ResultPath": "$.audit",
+      "Next": "NotifyRolledBack"
+    },
+
+    "AuditRollbackFailed": {
+      "Type": "Task",
+      "Resource": "${AuditFunctionArn}",
+      "Parameters": {
+        "action.$": "$.action",
+        "outcome": "ROLLBACK_FAILED",
+        "event": "action.rollback_failed",
+        "detail.$": "$"
+      },
+      "ResultPath": "$.audit",
+      "Next": "EscalateRollbackFailure"
+    },
+
+    "AuditAborted": {
+      "Type": "Task",
+      "Resource": "${AuditFunctionArn}",
+      "Parameters": {
+        "action.$": "$.action",
+        "outcome": "ABORTED",
+        "event": "action.aborted",
+        "detail.$": "$"
+      },
+      "ResultPath": "$.audit",
+      "Comment": "An action refused before anything happened still gets a record. An action that vanished without trace is worse than one that failed.",
+      "Next": "Aborted"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${NotificationTopicArn}",
+        "Subject": "CloudWaste: remediation completed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "Succeeded",
+          "Comment": "A failed notification must not fail a successful remediation."
+        }
+      ],
+      "Next": "Succeeded"
+    },
+
+    "NotifyRolledBack": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${NotificationTopicArn}",
+        "Subject": "CloudWaste: remediation rolled back",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "RolledBack"
+        }
+      ],
+      "Next": "RolledBack"
+    },
+
+    "EscalateRollbackFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${EscalationTopicArn}",
+        "Subject": "CloudWaste ESCALATION: action failed AND rollback failed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Comment": "Deliberately a separate topic from the routine notifications. The resource may be in an intermediate state and the checkpoint in the message records what it looked like beforehand. This one pages a human.",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "RollbackFailed"
+    },
+
+    "Succeeded": {
+      "Type": "Succeed"
+    },
+
+    "RolledBack": {
+      "Type": "Fail",
+      "Error": "RemediationRolledBack",
+      "Cause": "The action was executed but verification failed, so it was rolled back. The resource is in its original state."
+    },
+
+    "RollbackFailed": {
+      "Type": "Fail",
+      "Error": "RemediationRollbackFailed",
+      "Cause": "The action failed AND the rollback failed. The resource may be in an intermediate state and requires manual intervention. See the audit record for the checkpoint captured before execution."
+    },
+
+    "Aborted": {
+      "Type": "Fail",
+      "Error": "RemediationAborted",
+      "Cause": "The action was refused before any change was made, by validation, policy, approval or preflight. No AWS resource was modified."
+    }
+  }
+}

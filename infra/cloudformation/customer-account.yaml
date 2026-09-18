@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudWaste Autopilot cross-account role. Deploy this in each AWS account you
+  want CloudWaste to analyze. Read permissions are granted unconditionally;
+  write permissions are opt-in per capability and default to off.
+
+Parameters:
+  CloudWasteAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: The AWS account running CloudWaste.
+  ExternalId:
+    Type: String
+    MinLength: 8
+    Description: >-
+      From the CloudWaste stack's ExternalId output. This is what stops a third
+      party who learns your role ARN from assuming it (the confused deputy
+      problem), so it must not be guessable or shared.
+  EnableRemediation:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Grants the non-destructive write permissions: stop/start/resize EC2,
+      convert EBS volume types, change Lambda memory, add S3 lifecycle rules.
+      With this false, CloudWaste can only ever report.
+  EnableDestructiveRemediation:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Additionally grants DeleteVolume and ReleaseAddress. Separate from
+      EnableRemediation on purpose: "resize my dev instances" and "delete my
+      volumes" are different decisions and should not share one switch. The
+      snapshot permission is granted alongside, because CloudWaste refuses to
+      delete a volume it has not first confirmed a snapshot for.
+
+Conditions:
+  RemediationEnabled: !Equals [!Ref EnableRemediation, "true"]
+  DestructiveEnabled: !Equals [!Ref EnableDestructiveRemediation, "true"]
+
+Resources:
+
+  CloudWasteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudWasteAutopilotRole
+      Description: Role assumed by CloudWaste Autopilot to analyze and optionally remediate this account.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CloudWasteAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+
+        # ------------------------------------------------------------
+        # Read. Always granted. Nothing here can change anything.
+        # ------------------------------------------------------------
+        - PolicyName: CloudWasteReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CostAndOptimization
+                Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostAndUsageWithResources
+                  - ce:GetCostForecast
+                  - ce:GetAnomalies
+                  - ce:GetAnomalyMonitors
+                  - ce:GetAnomalySubscriptions
+                  - ce:GetDimensionValues
+                  - ce:GetTags
+                  - cost-optimization-hub:ListRecommendations
+                  - cost-optimization-hub:GetRecommendation
+                  - cost-optimization-hub:ListEnrollmentStatuses
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - compute-optimizer:GetECSServiceRecommendations
+                  - compute-optimizer:GetRDSDatabaseRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                  - compute-optimizer:GetEnrollmentStatus
+                  - pricing:GetProducts
+                Resource: "*"
+
+              - Sid: ResourceDiscovery
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeTags
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBSnapshots
+                  - rds:DescribeOrderableDBInstanceOptions
+                  - rds:ListTagsForResource
+                  - lambda:ListFunctions
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunctionConcurrency
+                  - lambda:ListTags
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetBucketTagging
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetBucketVersioning
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                Resource: "*"
+
+              - Sid: Telemetry
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudtrail:LookupEvents
+                Resource: "*"
+
+        # ------------------------------------------------------------
+        # Write, non-destructive. Every action here is reversible.
+        # ------------------------------------------------------------
+        - !If
+          - RemediationEnabled
+          - PolicyName: CloudWasteRemediation
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: Ec2PowerAndSize
+                  Effect: Allow
+                  Action:
+                    - ec2:StopInstances
+                    - ec2:StartInstances
+                    - ec2:ModifyInstanceAttribute
+                  Resource: "*"
+                  Condition:
+                    # Production is never touched unattended by policy, and this
+                    # makes the same statement at the IAM layer so that a policy
+                    # bug cannot reach a production instance. Defence in depth:
+                    # the policy engine can be misconfigured, IAM cannot be
+                    # talked around.
+                    StringNotEquals:
+                      aws:ResourceTag/Environment: [production, prod, Production, PROD]
+
+                - Sid: EbsVolumeTypeConversion
+                  Effect: Allow
+                  Action: ec2:ModifyVolume
+                  Resource: "*"
+                  Condition:
+                    StringNotEquals:
+                      aws:ResourceTag/Environment: [production, prod, Production, PROD]
+
+                - Sid: LambdaMemory
+                  Effect: Allow
+                  Action: lambda:UpdateFunctionConfiguration
+                  Resource: "*"
+
+                - Sid: S3Lifecycle
+                  Effect: Allow
+                  Action:
+                    - s3:PutLifecycleConfiguration
+                    - s3:DeleteLifecycleConfiguration
+                  Resource: "*"
+
+                - Sid: RdsResize
+                  Effect: Allow
+                  Action: rds:ModifyDBInstance
+                  Resource: "*"
+                  Condition:
+                    StringNotEquals:
+                      aws:ResourceTag/Environment: [production, prod, Production, PROD]
+          - !Ref AWS::NoValue
+
+        # ------------------------------------------------------------
+        # Write, destructive. Separately opted into.
+        # ------------------------------------------------------------
+        - !If
+          - DestructiveEnabled
+          - PolicyName: CloudWasteDestructiveRemediation
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                # Granted first and unconditionally: CloudWaste will not delete
+                # a volume it cannot first snapshot, so withholding this would
+                # simply make every deletion fail at preflight.
+                - Sid: SnapshotBeforeDelete
+                  Effect: Allow
+                  Action:
+                    - ec2:CreateSnapshot
+                    - ec2:CreateTags
+                  Resource: "*"
+
+                - Sid: DeleteUnattachedVolumes
+                  Effect: Allow
+                  Action: ec2:DeleteVolume
+                  Resource: "*"
+                  Condition:
+                    StringNotEquals:
+                      aws:ResourceTag/Environment: [production, prod, Production, PROD]
+
+                - Sid: ReleaseUnusedAddresses
+                  Effect: Allow
+                  Action: ec2:ReleaseAddress
+                  Resource: "*"
+
+                # Restoring a snapshot into a new volume is how a deletion is
+                # recovered. Without it, the rollback path does not exist.
+                - Sid: RestoreFromSnapshot
+                  Effect: Allow
+                  Action: ec2:CreateVolume
+                  Resource: "*"
+          - !Ref AWS::NoValue
+
+Outputs:
+  RoleArn:
+    Description: Register this with CloudWaste via POST /api/v1/accounts.
+    Value: !GetAtt CloudWasteRole.Arn
+  PermissionLevel:
+    Value: !If
+      - DestructiveEnabled
+      - "read + remediation + destructive (delete volumes, release addresses)"
+      - !If
+        - RemediationEnabled
+        - "read + remediation (reversible changes only)"
+        - "read-only (CloudWaste can report but never change anything)"
