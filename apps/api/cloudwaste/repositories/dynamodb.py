@@ -31,11 +31,12 @@ from ..models.domain import (
     Action,
     AuditLog,
     Finding,
+    OptimizationPlan,
     Recommendation,
     Resource,
     Scan,
 )
-from .base import KEY_FIELDS
+from .base import KEY_FIELDS, is_bare_resource_id
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,28 @@ class DynamoRepository(Generic[T]):
             logger.error("dynamodb get failed on %s: %s", self.table_name, exc)
             raise
         item = response.get("Item")
+        if item is None and self._key == "resource_key" and is_bare_resource_id(key):
+            return self._unique_by_resource_id(key)
         return self._deserialize(item) if item else None
+
+    def _unique_by_resource_id(self, resource_id: str) -> T | None:
+        """Legacy lookup by bare AWS id; see MemoryRepository for the rule.
+
+        A filtered scan, so it is slow on a large table. Application code looks
+        resources up by composite key; this exists for older API callers.
+        """
+        from boto3.dynamodb.conditions import Attr
+
+        items: list[dict] = []
+        kwargs: dict[str, Any] = {"FilterExpression": Attr("resource_id").eq(resource_id)}
+        while True:
+            response = self._table.scan(**kwargs)
+            items.extend(response.get("Items", []))
+            token = response.get("LastEvaluatedKey")
+            if not token or len(items) > 1:
+                break
+            kwargs["ExclusiveStartKey"] = token
+        return self._deserialize(items[0]) if len(items) == 1 else None
 
     def put(self, item: T) -> T:
         payload = _to_dynamo(item.model_dump(mode="json"))
@@ -159,6 +181,10 @@ class DynamoRepository(Generic[T]):
         return self._model(**_from_dynamo(item))
 
 
+class StorageConfigurationError(RuntimeError):
+    """storage_backend=dynamodb but the tables cannot be reached."""
+
+
 class DynamoRepositories:
     def __init__(self, settings: Settings | None = None) -> None:
         settings = settings or get_settings()
@@ -169,9 +195,42 @@ class DynamoRepositories:
         self.actions = DynamoRepository(Action, settings)
         self.audit = DynamoRepository(AuditLog, settings)
         self.scans = DynamoRepository(Scan, settings)
+        self.plans = DynamoRepository(OptimizationPlan, settings)
+
+    def all(self) -> list[DynamoRepository]:
+        return [
+            self.accounts, self.resources, self.findings, self.recommendations,
+            self.actions, self.audit, self.scans, self.plans,
+        ]
+
+    def verify_tables(self) -> None:
+        """Fail at startup, clearly, if any table is missing or unreachable.
+
+        There is no fallback to in-memory storage: an operator who configured
+        DynamoDB and silently got a process-local store would lose every
+        approval and audit record on the next restart without knowing it.
+        """
+        problems = []
+        for repo in self.all():
+            try:
+                repo._table.load()
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "ClientError")
+                problems.append(f"{repo.table_name}: {code}")
+            except Exception as exc:  # noqa: BLE001 - e.g. no credentials, no endpoint
+                problems.append(f"{repo.table_name}: {type(exc).__name__}: {exc}")
+        if problems:
+            raise StorageConfigurationError(
+                "storage_backend=dynamodb but these tables are not usable: "
+                + "; ".join(problems)
+                + ". Deploy infra/cloudformation/cloudwaste.yaml or set "
+                "CLOUDWASTE_STORAGE_BACKEND=memory explicitly."
+            )
 
 
-TABLE_MODELS = (Account, Resource, Finding, Recommendation, Action, AuditLog, Scan)
+TABLE_MODELS = (
+    Account, Resource, Finding, Recommendation, Action, AuditLog, Scan, OptimizationPlan,
+)
 
 
 def table_definitions(prefix: str = "CloudWaste") -> list[dict]:

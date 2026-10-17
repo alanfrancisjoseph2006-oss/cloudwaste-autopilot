@@ -146,7 +146,13 @@ class AwsCostProvider:
         days = max((end - start).days, 1)
         return round(total / days * 30.0, 2)
 
-    def get_forecast(self, days: int = 30) -> float:
+    def get_forecast(self, days: int = 30) -> float | None:
+        """AWS's own forecast of spend over the next `days` days.
+
+        None when Cost Explorer cannot produce one (new accounts, too little
+        history, or no permission). Never 0.0: a missing forecast shown as $0
+        reads as "you will spend nothing".
+        """
         start = datetime.now(timezone.utc) + timedelta(days=1)
         end = start + timedelta(days=days)
         response = soft_call(
@@ -157,8 +163,8 @@ class AwsCostProvider:
             default=None,
             context="ce:GetCostForecast",
         )
-        if not response:
-            return 0.0
+        if not response or "Total" not in response:
+            return None
         return round(float(response["Total"]["Amount"]), 2)
 
     def get_anomalies(self, start: datetime, end: datetime) -> list[CostAnomaly]:

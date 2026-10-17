@@ -22,6 +22,7 @@ from ..adapters import pricing
 from ..models.domain import Finding, Recommendation, Resource
 from ..models.enums import ActionType, ResourceType, WasteType
 from . import impact_analyzer
+from .backups import has_recent_backup
 
 logger = logging.getLogger(__name__)
 
@@ -173,9 +174,7 @@ class RecommendationEngine:
 
     def _for_unattached_storage(self, finding, resource, context) -> list[Recommendation]:
         config = resource.configuration
-        has_snapshot = config.get("latest_snapshot_id") is not None
-        snapshot_age = config.get("latest_snapshot_age_days")
-        snapshot_is_current = has_snapshot and (snapshot_age is None or snapshot_age <= 30)
+        snapshot_is_current = has_recent_backup(resource)
 
         delete = self._make(
             finding,
@@ -327,15 +326,16 @@ class RecommendationEngine:
         parameters: dict,
         rationale: str,
     ) -> Recommendation:
+        # Priced from the finding's own cost and its own source, so the
+        # projection and the current cost come from the same place. The
+        # simulate endpoint re-runs exactly this call.
         simulation = impact_analyzer.simulate(
             resource,
             action_type,
             parameters,
             current_monthly_cost=finding.monthly_cost,
             confidence=finding.confidence,
-            cost_source="cost_explorer"
-            if resource.configuration.get("price_source") == "cost_explorer"
-            else "price_book",
+            cost_source=finding.cost_source,
         )
         return Recommendation(
             finding_id=finding.finding_id,

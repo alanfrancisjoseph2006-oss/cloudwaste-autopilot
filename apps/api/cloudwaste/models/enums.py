@@ -125,6 +125,26 @@ class ExecutionStatus(str, Enum):
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
 
 
+class SavingsStatus(str, Enum):
+    """Where an action's saving sits between "estimated" and "proven".
+
+    A saving is never reported as realized on the strength of a simulation.
+    AWS billing lags by up to a day, and resource-level cost data may not exist
+    at all, so the lifecycle has explicit waiting and unprovable states rather
+    than collapsing everything into a single number.
+    """
+
+    ESTIMATED = "ESTIMATED"                          # proposed, not executed
+    NOT_APPLICABLE = "NOT_APPLICABLE"                # dry run, rolled back, or failed
+    EXECUTED_PENDING_BILLING = "EXECUTED_PENDING_BILLING"  # executed, billing not yet observable
+    VERIFICATION_PENDING = "VERIFICATION_PENDING"    # some billing, not enough to judge
+    VERIFIED = "VERIFIED"                            # observed saving matches the estimate
+    PARTIALLY_VERIFIED = "PARTIALLY_VERIFIED"        # observed saving is real but smaller
+    NO_SAVINGS = "NO_SAVINGS"                        # billing shows no material reduction
+    UNVERIFIABLE = "UNVERIFIABLE"                    # no resource-level billing to attribute
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"      # the reconciliation itself errored
+
+
 class PolicyDecision(str, Enum):
     AUTO_EXECUTE = "AUTO_EXECUTE"
     REQUIRE_APPROVAL = "REQUIRE_APPROVAL"

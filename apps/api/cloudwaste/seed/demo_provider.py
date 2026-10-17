@@ -28,6 +28,7 @@ from ..adapters.base import (
     ActivityEvent,
     CostAnomaly,
     CostPoint,
+    DependencyFacts,
     MetricPoint,
     MetricSeries,
     OptimizerRecommendation,
@@ -332,6 +333,199 @@ _SPECS: list[dict[str, Any]] = [
 
 
 # ---------------------------------------------------------------------------
+# Relationships, kept apart from _SPECS so the detection fixtures (and the
+# exact numbers tests assert against them) are untouched. Each entry lists what
+# a live lookup would have been able to inspect (`checked`) and what it could
+# not (`unknown`), because a demo that always knows everything would hide the
+# case the dependency analyzer exists for.
+# ---------------------------------------------------------------------------
+
+
+def _rel(type_: str, id_: str, relationship: str, direction: str, category: str, detail: str = ""):
+    return {
+        "type": type_, "id": id_, "relationship": relationship,
+        "direction": direction, "category": category, "detail": detail,
+    }
+
+
+_LB_UNKNOWN = {
+    "category": "load_balancer_targets",
+    "reason": "Target group membership is not inspected; an instance behind a load "
+              "balancer serves traffic that CPU alone does not show",
+}
+
+_DEPENDENCIES: dict[str, dict[str, Any]] = {
+    "i-0a1b2c3d4e5f60001": {
+        "relationships": [
+            _rel("EBS", "vol-0a1b2c3d4e5f60001", "attached at /dev/xvda", "uses", "ebs_volumes",
+                 "deleted on termination"),
+            _rel("ENI", "eni-0demo00000000011", "network interface", "uses", "network_interfaces",
+                 "private IP 10.0.1.24"),
+            _rel("SECURITY_GROUP", "sg-0demo0etl0000001", "etl-runner", "uses", "security_groups"),
+            _rel("IAM_INSTANCE_PROFILE",
+                 "arn:aws:iam::123456789012:instance-profile/etl-runner", "instance role",
+                 "uses", "iam_instance_profile"),
+        ],
+        "checked": ["ebs_volumes", "network_interfaces", "security_groups",
+                    "iam_instance_profile", "auto_scaling_group"],
+        "unknown": [_LB_UNKNOWN],
+    },
+    "i-0a1b2c3d4e5f60002": {
+        "relationships": [
+            _rel("EBS", "vol-0a1b2c3d4e5f60002", "attached at /dev/xvda", "uses", "ebs_volumes",
+                 "deleted on termination"),
+            _rel("ENI", "eni-0demo00000000021", "network interface", "uses", "network_interfaces",
+                 "private IP 10.0.1.57"),
+            _rel("SECURITY_GROUP", "sg-0demo0jenkins001", "jenkins-agents", "uses",
+                 "security_groups"),
+        ],
+        "checked": ["ebs_volumes", "network_interfaces", "security_groups",
+                    "iam_instance_profile", "auto_scaling_group"],
+        "unknown": [_LB_UNKNOWN],
+    },
+    "i-0a1b2c3d4e5f60003": {
+        "relationships": [
+            _rel("EBS", "vol-0a1b2c3d4e5f60003", "attached at /dev/xvdb", "uses", "ebs_volumes",
+                 "retained on termination"),
+            _rel("ELASTIC_IP", "eipalloc-0demo000000002", "associated address", "uses",
+                 "network_interfaces", "203.0.113.25"),
+            _rel("SECURITY_GROUP", "sg-0demo0payments01", "payments-api", "uses",
+                 "security_groups"),
+            _rel("AUTO_SCALING_GROUP", "payments-api-asg", "member of", "used_by",
+                 "auto_scaling_group", "the group may replace or resize this instance itself"),
+        ],
+        "checked": ["ebs_volumes", "network_interfaces", "security_groups",
+                    "iam_instance_profile", "auto_scaling_group"],
+        "unknown": [_LB_UNKNOWN],
+    },
+    "i-0a1b2c3d4e5f60004": {
+        "relationships": [
+            _rel("EBS", "vol-0a1b2c3d4e5f60004", "attached at /dev/xvdb", "uses", "ebs_volumes",
+                 "retained on termination"),
+            _rel("SECURITY_GROUP", "sg-0demo0reporting1", "reporting-workers", "uses",
+                 "security_groups"),
+            _rel("IAM_INSTANCE_PROFILE",
+                 "arn:aws:iam::123456789012:instance-profile/reporting-worker",
+                 "instance role", "uses", "iam_instance_profile"),
+        ],
+        "checked": ["ebs_volumes", "security_groups", "iam_instance_profile",
+                    "auto_scaling_group"],
+        "unknown": [
+            _LB_UNKNOWN,
+            {"category": "network_interfaces",
+             "reason": "permission denied for ec2:DescribeNetworkInterfaces"},
+        ],
+    },
+    # Untagged and owned by nobody known: the case where "we could not look"
+    # matters most.
+    "i-0a1b2c3d4e5f60005": {
+        "relationships": [
+            _rel("SECURITY_GROUP", "sg-0demo0default01", "default", "uses", "security_groups"),
+        ],
+        "checked": ["security_groups"],
+        "unknown": [
+            _LB_UNKNOWN,
+            {"category": "iam_instance_profile",
+             "reason": "permission denied for ec2:DescribeIamInstanceProfileAssociations"},
+            {"category": "network_interfaces",
+             "reason": "permission denied for ec2:DescribeNetworkInterfaces"},
+        ],
+    },
+    "vol-0a1b2c3d4e5f60006": {
+        "relationships": [
+            _rel("EBS_SNAPSHOT", "snap-0demo0001", "snapshot of this volume", "backup",
+                 "snapshots", "completed, 500 GB, 3 days old"),
+        ],
+        "checked": ["attachment", "snapshots"],
+        "unknown": [],
+    },
+    "vol-0a1b2c3d4e5f60007": {
+        "relationships": [],
+        "checked": ["attachment", "snapshots"],
+        "unknown": [],
+    },
+    "vol-0a1b2c3d4e5f60002": {
+        "relationships": [
+            _rel("EC2", "i-0a1b2c3d4e5f60002", "attached at /dev/xvda", "used_by", "attachment",
+                 "state attached"),
+        ],
+        "checked": ["attachment", "snapshots"],
+        "unknown": [],
+    },
+    "vol-0a1b2c3d4e5f60005": {
+        "relationships": [
+            _rel("EC2", "i-0a1b2c3d4e5f60006", "attached at /dev/xvdb", "used_by", "attachment",
+                 "state attached (instance stopped)"),
+        ],
+        "checked": ["attachment", "snapshots"],
+        "unknown": [],
+    },
+    "payments-prod-db": {
+        "relationships": [
+            _rel("SECURITY_GROUP", "sg-0demo0paydb0001", "VPC security group", "uses",
+                 "security_groups", "active"),
+            _rel("DB_SUBNET_GROUP", "payments-db-subnets", "subnet group", "uses", "subnet_group",
+                 "3 subnets in vpc-demo02"),
+            _rel("RDS", "payments-prod-db-replica-1", "read replica", "used_by", "read_replicas",
+                 "replicates from this instance"),
+        ],
+        "checked": ["security_groups", "subnet_group", "read_replicas", "parameter_group"],
+        "unknown": [{"category": "application_clients",
+                     "reason": "Which applications connect to this database is not visible "
+                               "to AWS APIs; connection counts are the only signal"}],
+    },
+    "analytics-dev-db": {
+        "relationships": [
+            _rel("SECURITY_GROUP", "sg-0demo0anadb0001", "VPC security group", "uses",
+                 "security_groups", "active"),
+            _rel("DB_SUBNET_GROUP", "dev-db-subnets", "subnet group", "uses", "subnet_group",
+                 "2 subnets in vpc-demo01"),
+        ],
+        "checked": ["security_groups", "subnet_group", "read_replicas", "parameter_group"],
+        "unknown": [{"category": "application_clients",
+                     "reason": "Which applications connect to this database is not visible "
+                               "to AWS APIs; connection counts are the only signal"}],
+    },
+    "image-thumbnailer": {
+        "relationships": [
+            _rel("EVENT_SOURCE", "arn:aws:sqs:us-east-1:123456789012:thumbnail-jobs",
+                 "event source mapping", "used_by", "event_sources", "Enabled"),
+        ],
+        "checked": ["event_sources", "vpc_config"],
+        "unknown": [{"category": "push_invokers",
+                     "reason": "Services that invoke the function directly are recorded on "
+                               "those services, not on the function"}],
+    },
+    "nat-0demo00000000001": {
+        "relationships": [
+            _rel("ROUTE_TABLE", "rtb-demo-private-a",
+                 "routes outbound traffic through this gateway", "used_by", "route_tables",
+                 "2 subnet association(s)"),
+        ],
+        "checked": ["route_tables"],
+        "unknown": [],
+    },
+    "eipalloc-0demo000000001": {
+        "relationships": [],
+        "checked": ["association"],
+        "unknown": [{"category": "external_allow_lists",
+                     "reason": "Firewalls, DNS records and partner allow-lists outside AWS "
+                               "may reference this address; AWS cannot see them"}],
+    },
+    "eipalloc-0demo000000002": {
+        "relationships": [
+            _rel("EC2", "i-0a1b2c3d4e5f60003", "associated", "used_by", "association",
+                 "203.0.113.25"),
+        ],
+        "checked": ["association"],
+        "unknown": [{"category": "external_allow_lists",
+                     "reason": "Firewalls, DNS records and partner allow-lists outside AWS "
+                               "may reference this address; AWS cannot see them"}],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
 
@@ -376,6 +570,20 @@ class DemoInventoryProvider:
 
     def spec_for(self, resource_id: str) -> dict[str, Any] | None:
         return next((s for s in _SPECS if s["resource_id"] == resource_id), None)
+
+    def describe_dependencies(self, resource: Resource) -> DependencyFacts:
+        """Synthetic relationships from `_DEPENDENCIES`, shaped like the live
+        adapter's output, including categories it could not inspect."""
+        entry = _DEPENDENCIES.get(resource.resource_id)
+        if entry is None:
+            return DependencyFacts(
+                unknown=[{"category": "all", "reason": "No dependency data for this resource"}]
+            )
+        return DependencyFacts(
+            relationships=[{**r, "source": "aws"} for r in entry.get("relationships", [])],
+            checked=list(entry.get("checked", [])),
+            unknown=[dict(u) for u in entry.get("unknown", [])],
+        )
 
 
 class DemoMetricsProvider:

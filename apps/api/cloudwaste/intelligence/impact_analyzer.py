@@ -22,6 +22,7 @@ from ..adapters import pricing
 from ..models.domain import Resource, SimulationResult
 from ..models.enums import ActionType, ResourceType, RiskLevel
 from . import risk_engine
+from .backups import has_recent_backup
 
 # Upper-bound downtime, in seconds, for the actions that interrupt service.
 DOWNTIME_ESTIMATES: dict[ActionType, int] = {
@@ -90,7 +91,7 @@ def simulate(
             rollback_possible=rollback_possible,
             restart_required=action_type.requires_restart,
             downtime_seconds=downtime,
-            has_recent_backup=_has_recent_backup(resource),
+            has_recent_backup=has_recent_backup(resource),
             data_bearing=risk_engine.is_data_bearing(resource, action_type),
         )
     )
@@ -109,6 +110,32 @@ def simulate(
         performance_impact=_performance_impact(resource, action_type, parameters),
         assumptions=assumptions,
         priced_from=priced_from,
+    )
+
+
+def resimulate(recommendation, resource: Resource, finding=None) -> SimulationResult:
+    """Re-run a recommendation's simulation with the pricing it was built on.
+
+    The stored recommendation was priced from the finding's cost and that
+    cost's source (observed billing or list price). Re-simulating from
+    `resource.monthly_cost` instead would compare a list price against an
+    observed bill and report a different saving for the same plan.
+    """
+    stored = recommendation.simulation
+    if finding is not None:
+        current, source = finding.monthly_cost, finding.cost_source
+    elif stored is not None:
+        current, source = stored.current_monthly_cost, stored.priced_from
+    else:
+        current = resource.monthly_cost
+        source = resource.configuration.get("price_source", "price_book")
+    return simulate(
+        resource,
+        recommendation.action_type,
+        recommendation.action_parameters,
+        current_monthly_cost=current,
+        confidence=recommendation.confidence,
+        cost_source=source,
     )
 
 
@@ -332,16 +359,6 @@ def _performance_impact(
     if action_type is ActionType.RELEASE_ELASTIC_IP:
         return "No performance impact. The address serves no traffic."
     return "No measurable performance impact expected."
-
-
-def _has_recent_backup(resource: Resource) -> bool:
-    config = resource.configuration
-    if resource.resource_type is ResourceType.EBS:
-        age = config.get("latest_snapshot_age_days")
-        return config.get("latest_snapshot_id") is not None and (age is None or age <= 30)
-    if resource.resource_type is ResourceType.RDS:
-        return (config.get("backup_retention_days") or 0) > 0
-    return False
 
 
 def compare(before: SimulationResult, after_cost: float) -> dict:

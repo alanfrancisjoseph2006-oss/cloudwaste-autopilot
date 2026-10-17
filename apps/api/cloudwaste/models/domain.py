@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from .enums import (
     ActionType,
@@ -22,6 +22,7 @@ from .enums import (
     PolicyDecision,
     ResourceType,
     RiskLevel,
+    SavingsStatus,
     WasteType,
 )
 
@@ -36,6 +37,21 @@ def _uid(prefix: str) -> str:
 
 class Base(BaseModel):
     model_config = ConfigDict(use_enum_values=False, populate_by_name=True)
+
+
+def resource_key(account_id: str, region: str, resource_id: str) -> str:
+    """Storage key for a resource.
+
+    AWS ids are not globally unique: an RDS identifier or a Lambda function name
+    is unique only within one account and region. Keying storage on the bare id
+    would let a second account's `payments-db` silently overwrite the first's,
+    and an action planned against one could then resolve to the other.
+    """
+    return f"{account_id}:{region}:{resource_id}"
+
+
+#: Price sources that mean "we do not actually know what this costs".
+UNKNOWN_COST_SOURCES = frozenset({"unpriced", "unavailable"})
 
 
 # --------------------------------------------------------------------------
@@ -66,6 +82,22 @@ class Resource(Base):
 
     monthly_cost: float = 0.0
     discovered_at: datetime = Field(default_factory=_now)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def resource_key(self) -> str:
+        return resource_key(self.account_id, self.region, self.resource_id)
+
+    @property
+    def cost_known(self) -> bool:
+        """False when `monthly_cost` is a placeholder rather than a price.
+
+        `monthly_cost` stays a float for compatibility, so an unpriced instance
+        type or a bucket whose size CloudWatch has not published carries 0.0
+        there. This is how callers tell that apart from a genuinely free
+        resource, and they must exclude it from totals rather than add a zero.
+        """
+        return self.configuration.get("price_source") not in UNKNOWN_COST_SOURCES
 
     @property
     def age_days(self) -> float:
@@ -149,6 +181,10 @@ class Finding(Base):
     evidence: list[Evidence] = Field(default_factory=list)
 
     detector: str = ""
+    # Where `monthly_cost` came from: "cost_explorer" (observed billing) or
+    # "price_book" (list-price estimate). Simulation must price from the same
+    # source, or the saving is part saving and part accounting artifact.
+    cost_source: str = "price_book"
     # Values the detector already computed that the recommendation engine needs
     # to size the action -- a Lambda duration projection, an S3 target class.
     # Carried on the finding so the two stages never have to agree twice.
@@ -301,6 +337,24 @@ class Action(Base):
 
     checkpoint: Checkpoint | None = None
     verifications: list[VerificationResult] = Field(default_factory=list)
+
+    # --- savings lifecycle ------------------------------------------------
+    # Estimated at planning time, verified against billing afterwards. The two
+    # are kept apart because AWS billing lags and resource-level cost data is
+    # often unavailable: a saving is only "verified" once Cost Explorer shows it.
+    savings_status: SavingsStatus = SavingsStatus.ESTIMATED
+    estimated_monthly_savings: float | None = None
+    baseline_monthly_cost: float | None = None
+    baseline_cost_source: str | None = None
+    projected_monthly_cost: float | None = None
+    observed_monthly_cost_after: float | None = None
+    verified_monthly_savings: float | None = None
+    savings_variance: float | None = None
+    savings_checked_at: datetime | None = None
+    savings_verified_at: datetime | None = None
+    savings_detail: str | None = None
+    # Kept for API compatibility. Only ever set from verified billing, never
+    # from a simulation; None means "not proven", not "zero".
     realized_monthly_savings: float | None = None
 
     requested_by: str = "system"
@@ -348,9 +402,81 @@ class Scan(Base):
 class Account(Base):
     account_id: str
     name: str
+    # Free-form labels for the multi-account view. Not used for risk: risk
+    # comes from each resource's own tags, never from an account-wide label.
+    environment: str | None = None
+    owner: str | None = None
     role_arn: str | None = None
     external_id: str | None = None
     regions: list[str] = Field(default_factory=lambda: ["us-east-1"])
     mode: Literal["live", "demo"] = "demo"
     enabled: bool = True
     created_at: datetime = Field(default_factory=_now)
+
+
+# --------------------------------------------------------------------------
+# Optimization goals and plans
+# --------------------------------------------------------------------------
+
+
+class PlanItem(Base):
+    """One selected opportunity. A chain (snapshot, then delete) is one item."""
+
+    recommendation_ids: list[str]
+    finding_id: str
+    resource_id: str
+    resource_type: ResourceType
+    region: str
+    action_types: list[ActionType]
+    title: str
+    service: str
+    monthly_savings: float
+    risk: RiskLevel
+    confidence: float
+    rollback_possible: bool
+    downtime_seconds: int = 0
+    policy_decision: PolicyDecision
+    policy_reasons: list[str] = Field(default_factory=list)
+    rank_score: float
+    reason: str
+    # Filled in when the plan is proposed; each is an ordinary PENDING action.
+    action_ids: list[str] = Field(default_factory=list)
+
+
+class PlanExclusion(Base):
+    recommendation_ids: list[str]
+    resource_id: str
+    monthly_savings: float
+    reason: str
+
+
+class OptimizationPlan(Base):
+    """A savings goal and the set of recommendations chosen to approach it.
+
+    A plan is a document, not an authorization. Proposing it creates ordinary
+    actions through the same policy and approval path as any other request;
+    nothing in a plan ever executes on its own.
+    """
+
+    plan_id: str = Field(default_factory=lambda: _uid("PLAN"))
+    account_id: str
+    goal_type: Literal["amount", "percent"]
+    goal_value: float
+    target_monthly_savings: float
+    baseline_monthly_spend: float | None = None
+    baseline_basis: str | None = None
+    max_risk: RiskLevel = RiskLevel.HIGH
+    min_confidence: float = 0.0
+    items: list[PlanItem] = Field(default_factory=list)
+    excluded: list[PlanExclusion] = Field(default_factory=list)
+    total_monthly_savings: float = 0.0
+    target_met: bool = False
+    shortfall: float = 0.0
+    risk_summary: dict[str, int] = Field(default_factory=dict)
+    savings_by_service: dict[str, float] = Field(default_factory=dict)
+    ranking_method: str = ""
+    notes: list[str] = Field(default_factory=list)
+    status: Literal["DRAFT", "PROPOSED"] = "DRAFT"
+    created_by: str = "system"
+    created_at: datetime = Field(default_factory=_now)
+    proposed_at: datetime | None = None

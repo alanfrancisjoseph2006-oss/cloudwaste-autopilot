@@ -15,6 +15,7 @@ from ..models.domain import (
     Action,
     AuditLog,
     Finding,
+    OptimizationPlan,
     Recommendation,
     Resource,
     Scan,
@@ -38,15 +39,24 @@ class Repositories(Protocol):
     actions: Repository[Action]
     audit: Repository[AuditLog]
     scans: Repository[Scan]
+    plans: Repository[OptimizationPlan]
 
 
 #: Primary key attribute for each model, shared by both implementations.
+#: Resources are keyed on account + region + id: AWS ids are only unique within
+#: one account and region, so a bare id would let two accounts collide.
 KEY_FIELDS: dict[str, str] = {
     "Account": "account_id",
-    "Resource": "resource_id",
+    "Resource": "resource_key",
     "Finding": "finding_id",
     "Recommendation": "recommendation_id",
     "Action": "action_id",
     "AuditLog": "audit_id",
     "Scan": "scan_id",
+    "OptimizationPlan": "plan_id",
 }
+
+
+def is_bare_resource_id(key: str) -> bool:
+    """True for a legacy lookup by AWS id rather than by composite key."""
+    return key.count(":") < 2

@@ -17,7 +17,8 @@ from botocore.exceptions import ClientError
 from ...models.domain import Resource
 from ...models.enums import ResourceType
 from .. import pricing, tags as tagging
-from .clients import get_client, paginate, soft_call
+from ..base import DependencyFacts
+from .clients import get_client, is_access_denied, paginate, soft_call
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,269 @@ class AwsInventoryProvider:
         inferred = _infer_type(resource_id)
         candidates = self.list_resources([inferred] if inferred else None)
         return next((r for r in candidates if r.resource_id == resource_id), None)
+
+    # ------------------------------------------------------------------
+    # Dependencies (on demand, read-only)
+    # ------------------------------------------------------------------
+
+    def describe_dependencies(self, resource: Resource) -> DependencyFacts:
+        """Relationships for one resource. Every call here is a Describe/List.
+
+        A category whose API call is denied or fails is reported as unknown
+        with the reason, so the analyzer never mistakes "could not look" for
+        "nothing there".
+        """
+        facts = DependencyFacts()
+        handler = {
+            ResourceType.EC2: self._deps_ec2,
+            ResourceType.EBS: self._deps_ebs,
+            ResourceType.RDS: self._deps_rds,
+            ResourceType.LAMBDA: self._deps_lambda,
+            ResourceType.NAT_GATEWAY: self._deps_nat,
+            ResourceType.ELASTIC_IP: self._deps_eip,
+        }.get(resource.resource_type)
+        if handler is None:
+            facts.unknown.append(
+                {
+                    "category": "all",
+                    "reason": f"No dependency lookup for {resource.resource_type.value}",
+                }
+            )
+            return facts
+        handler(resource, facts)
+        return facts
+
+    @staticmethod
+    def _dep_failed(facts: DependencyFacts, category: str, exc: Exception, api: str) -> None:
+        if isinstance(exc, ClientError) and is_access_denied(exc):
+            reason = f"permission denied for {api}"
+        else:
+            reason = f"{api} failed: {type(exc).__name__}"
+        facts.unknown.append({"category": category, "reason": reason})
+
+    @staticmethod
+    def _rel(facts, type_, id_, relationship, direction, category, detail=""):
+        facts.relationships.append(
+            {
+                "type": type_,
+                "id": id_,
+                "relationship": relationship,
+                "direction": direction,
+                "category": category,
+                "detail": detail,
+                "source": "aws",
+            }
+        )
+
+    def _deps_ec2(self, resource: Resource, facts: DependencyFacts) -> None:
+        ec2 = self._client("ec2")
+        try:
+            reservations = ec2.describe_instances(InstanceIds=[resource.resource_id])[
+                "Reservations"
+            ]
+        except ClientError as exc:
+            for category in (
+                "ebs_volumes", "network_interfaces", "security_groups",
+                "iam_instance_profile", "auto_scaling_group",
+            ):
+                self._dep_failed(facts, category, exc, "ec2:DescribeInstances")
+            return
+        instance = next((i for r in reservations for i in r.get("Instances", [])), {})
+        for mapping in instance.get("BlockDeviceMappings", []):
+            if "Ebs" in mapping:
+                ebs = mapping["Ebs"]
+                self._rel(
+                    facts, "EBS", ebs["VolumeId"], f"attached at {mapping.get('DeviceName')}",
+                    "uses", "ebs_volumes",
+                    "deleted on termination" if ebs.get("DeleteOnTermination")
+                    else "retained on termination",
+                )
+        facts.checked.append("ebs_volumes")
+        for eni in instance.get("NetworkInterfaces", []):
+            self._rel(
+                facts, "ENI", eni.get("NetworkInterfaceId"), "network interface", "uses",
+                "network_interfaces", f"private IP {eni.get('PrivateIpAddress')}",
+            )
+            public_ip = (eni.get("Association") or {}).get("PublicIp")
+            if public_ip:
+                self._rel(
+                    facts, "PUBLIC_IP", public_ip, "public address", "uses",
+                    "network_interfaces", "changes on stop/start unless it is an Elastic IP",
+                )
+        facts.checked.append("network_interfaces")
+        for group in instance.get("SecurityGroups", []):
+            self._rel(
+                facts, "SECURITY_GROUP", group.get("GroupId"),
+                group.get("GroupName") or "security group", "uses", "security_groups",
+            )
+        facts.checked.append("security_groups")
+        profile = instance.get("IamInstanceProfile")
+        if profile:
+            self._rel(
+                facts, "IAM_INSTANCE_PROFILE", profile.get("Arn"), "instance role", "uses",
+                "iam_instance_profile",
+            )
+        facts.checked.append("iam_instance_profile")
+        tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+        if tags.get("aws:autoscaling:groupName"):
+            self._rel(
+                facts, "AUTO_SCALING_GROUP", tags["aws:autoscaling:groupName"], "member of",
+                "used_by", "auto_scaling_group",
+                "the group may replace or resize this instance itself",
+            )
+        facts.checked.append("auto_scaling_group")
+        facts.unknown.append(
+            {
+                "category": "load_balancer_targets",
+                "reason": "Target group membership is not inspected; an instance behind "
+                "a load balancer serves traffic that CPU alone does not show",
+            }
+        )
+
+    def _deps_ebs(self, resource: Resource, facts: DependencyFacts) -> None:
+        ec2 = self._client("ec2")
+        try:
+            volume = ec2.describe_volumes(VolumeIds=[resource.resource_id])["Volumes"][0]
+            for attachment in volume.get("Attachments", []):
+                self._rel(
+                    facts, "EC2", attachment.get("InstanceId"),
+                    f"attached at {attachment.get('Device')}", "used_by", "attachment",
+                    f"state {attachment.get('State')}",
+                )
+            facts.checked.append("attachment")
+        except (ClientError, IndexError) as exc:
+            self._dep_failed(facts, "attachment", exc, "ec2:DescribeVolumes")
+        try:
+            snapshots = ec2.describe_snapshots(
+                OwnerIds=["self"],
+                Filters=[{"Name": "volume-id", "Values": [resource.resource_id]}],
+            )["Snapshots"]
+            for snap in sorted(snapshots, key=lambda s: s["StartTime"], reverse=True)[:5]:
+                self._rel(
+                    facts, "EBS_SNAPSHOT", snap["SnapshotId"], "snapshot of this volume",
+                    "backup", "snapshots",
+                    f"{snap.get('State')}, {snap.get('VolumeSize')} GB, "
+                    f"{snap['StartTime']:%Y-%m-%d}",
+                )
+            facts.checked.append("snapshots")
+        except ClientError as exc:
+            self._dep_failed(facts, "snapshots", exc, "ec2:DescribeSnapshots")
+
+    def _deps_rds(self, resource: Resource, facts: DependencyFacts) -> None:
+        rds = self._client("rds")
+        try:
+            db = rds.describe_db_instances(DBInstanceIdentifier=resource.resource_id)[
+                "DBInstances"
+            ][0]
+        except (ClientError, IndexError) as exc:
+            for category in ("security_groups", "subnet_group", "read_replicas", "parameter_group"):
+                self._dep_failed(facts, category, exc, "rds:DescribeDBInstances")
+            return
+        for group in db.get("VpcSecurityGroups", []):
+            self._rel(
+                facts, "SECURITY_GROUP", group.get("VpcSecurityGroupId"),
+                "VPC security group", "uses", "security_groups", group.get("Status", ""),
+            )
+        facts.checked.append("security_groups")
+        subnet_group = db.get("DBSubnetGroup") or {}
+        if subnet_group:
+            self._rel(
+                facts, "DB_SUBNET_GROUP", subnet_group.get("DBSubnetGroupName"),
+                "subnet group", "uses", "subnet_group",
+                f"{len(subnet_group.get('Subnets', []))} subnets in {subnet_group.get('VpcId')}",
+            )
+        facts.checked.append("subnet_group")
+        for replica in db.get("ReadReplicaDBInstanceIdentifiers", []):
+            self._rel(
+                facts, "RDS", replica, "read replica", "used_by", "read_replicas",
+                "replicates from this instance",
+            )
+        if db.get("ReadReplicaSourceDBInstanceIdentifier"):
+            self._rel(
+                facts, "RDS", db["ReadReplicaSourceDBInstanceIdentifier"], "replica source",
+                "uses", "read_replicas", "this instance is a replica",
+            )
+        facts.checked.append("read_replicas")
+        for group in db.get("DBParameterGroups", []):
+            self._rel(
+                facts, "DB_PARAMETER_GROUP", group.get("DBParameterGroupName"),
+                "parameter group", "uses", "parameter_group",
+                group.get("ParameterApplyStatus", ""),
+            )
+        facts.checked.append("parameter_group")
+        facts.unknown.append(
+            {
+                "category": "application_clients",
+                "reason": "Which applications connect to this database is not visible to "
+                "AWS APIs; connection counts are the only signal",
+            }
+        )
+
+    def _deps_lambda(self, resource: Resource, facts: DependencyFacts) -> None:
+        lam = self._client("lambda")
+        try:
+            mappings = lam.list_event_source_mappings(FunctionName=resource.resource_id)
+            for mapping in mappings.get("EventSourceMappings", []):
+                self._rel(
+                    facts, "EVENT_SOURCE", mapping.get("EventSourceArn"),
+                    "event source mapping", "used_by", "event_sources",
+                    mapping.get("State", ""),
+                )
+            facts.checked.append("event_sources")
+        except ClientError as exc:
+            self._dep_failed(facts, "event_sources", exc, "lambda:ListEventSourceMappings")
+        try:
+            config = lam.get_function_configuration(FunctionName=resource.resource_id)
+            for group in (config.get("VpcConfig") or {}).get("SecurityGroupIds", []):
+                self._rel(facts, "SECURITY_GROUP", group, "VPC access", "uses", "vpc_config")
+            facts.checked.append("vpc_config")
+        except ClientError as exc:
+            self._dep_failed(facts, "vpc_config", exc, "lambda:GetFunctionConfiguration")
+        facts.unknown.append(
+            {
+                "category": "push_invokers",
+                "reason": "Services that invoke the function directly (API Gateway, S3 "
+                "notifications, EventBridge) are recorded on those services, not on "
+                "the function",
+            }
+        )
+
+    def _deps_nat(self, resource: Resource, facts: DependencyFacts) -> None:
+        ec2 = self._client("ec2")
+        try:
+            tables = ec2.describe_route_tables(
+                Filters=[{"Name": "route.nat-gateway-id", "Values": [resource.resource_id]}]
+            )["RouteTables"]
+            for table in tables:
+                self._rel(
+                    facts, "ROUTE_TABLE", table.get("RouteTableId"),
+                    "routes outbound traffic through this gateway", "used_by", "route_tables",
+                    f"{len(table.get('Associations', []))} subnet association(s)",
+                )
+            facts.checked.append("route_tables")
+        except ClientError as exc:
+            self._dep_failed(facts, "route_tables", exc, "ec2:DescribeRouteTables")
+
+    def _deps_eip(self, resource: Resource, facts: DependencyFacts) -> None:
+        ec2 = self._client("ec2")
+        try:
+            address = ec2.describe_addresses(AllocationIds=[resource.resource_id])["Addresses"][0]
+            if address.get("AssociationId"):
+                self._rel(
+                    facts, "EC2" if address.get("InstanceId") else "ENI",
+                    address.get("InstanceId") or address.get("NetworkInterfaceId"),
+                    "associated", "used_by", "association", address.get("PublicIp", ""),
+                )
+            facts.checked.append("association")
+        except (ClientError, IndexError) as exc:
+            self._dep_failed(facts, "association", exc, "ec2:DescribeAddresses")
+        facts.unknown.append(
+            {
+                "category": "external_allow_lists",
+                "reason": "Firewalls, DNS records and partner allow-lists outside AWS may "
+                "reference this address; AWS cannot see them",
+            }
+        )
 
     # ------------------------------------------------------------------
     # Per-service discovery
@@ -212,7 +476,9 @@ class AwsInventoryProvider:
             )
             size_gb = _bucket_size_gb(cloudwatch, name)
             object_count = _bucket_object_count(cloudwatch, name)
-            price = pricing.s3_monthly("STANDARD", size_gb)
+            # CloudWatch publishes storage metrics once a day and not at all for
+            # a new or empty-of-metrics bucket. Unknown size is not zero size.
+            price = pricing.s3_monthly("STANDARD", size_gb) if size_gb is not None else None
             out.append(
                 self._build(
                     name,
@@ -221,14 +487,14 @@ class AwsInventoryProvider:
                     name=name,
                     arn=f"arn:aws:s3:::{name}",
                     created_at=bucket.get("CreationDate"),
-                    monthly_cost=price.monthly,
+                    monthly_cost=price.monthly if price else 0.0,
                     configuration={
                         "size_gb": size_gb,
                         "object_count": object_count,
                         "storage_class": "STANDARD",
                         "has_lifecycle_policy": bool(lifecycle),
                         "lifecycle_rules": (lifecycle or {}).get("Rules", []),
-                        "price_source": price.source,
+                        "price_source": price.source if price else "unavailable",
                     },
                 )
             )
@@ -370,7 +636,7 @@ class AwsInventoryProvider:
 # ----------------------------------------------------------------------
 
 
-def _bucket_size_gb(cloudwatch, bucket: str) -> float:
+def _bucket_size_gb(cloudwatch, bucket: str) -> float | None:
     """S3 has no cheap size API, so read the daily CloudWatch storage metric."""
     from datetime import timedelta
 
@@ -392,12 +658,12 @@ def _bucket_size_gb(cloudwatch, bucket: str) -> float:
     )
     points = (stats or {}).get("Datapoints", [])
     if not points:
-        return 0.0
+        return None
     latest = max(points, key=lambda p: p["Timestamp"])
     return round(latest["Average"] / (1024**3), 3)
 
 
-def _bucket_object_count(cloudwatch, bucket: str) -> int:
+def _bucket_object_count(cloudwatch, bucket: str) -> int | None:
     from datetime import timedelta
 
     end = datetime.now(timezone.utc)
@@ -418,7 +684,7 @@ def _bucket_object_count(cloudwatch, bucket: str) -> int:
     )
     points = (stats or {}).get("Datapoints", [])
     if not points:
-        return 0
+        return None
     return int(max(points, key=lambda p: p["Timestamp"])["Average"])
 
 

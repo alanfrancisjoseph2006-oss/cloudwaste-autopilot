@@ -19,7 +19,7 @@ from typing import Any
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,23 @@ BOTO_CONFIG = Config(
 )
 
 
+class AssumeRoleError(RuntimeError):
+    """Customer credentials could not be obtained.
+
+    Raised instead of falling back to the host's own credentials. The customer
+    role is the permission boundary -- it is what denies writes to production
+    at the IAM layer -- so acting without it would bypass the one control that
+    does not depend on CloudWaste's own code being correct.
+    """
+
+
 class AwsSessionFactory:
-    """Builds boto3 sessions, assuming a role when one is configured."""
+    """Builds boto3 sessions, assuming a role when one is configured.
+
+    Credentials are cached per (role, external id) until five minutes before
+    they expire, then refreshed. They are never logged: log lines name the role
+    and the error code, nothing else.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -69,16 +84,41 @@ class AwsSessionFactory:
             if external_id:
                 params["ExternalId"] = external_id
 
-            response = sts.assume_role(**params)
-            creds = response["Credentials"]
+            try:
+                response = sts.assume_role(**params)
+            except (ClientError, BotoCoreError) as exc:
+                code = (
+                    exc.response.get("Error", {}).get("Code", "ClientError")
+                    if isinstance(exc, ClientError)
+                    else type(exc).__name__
+                )
+                logger.error("sts:AssumeRole failed for %s: %s", role_arn, code)
+                raise AssumeRoleError(
+                    f"Could not assume {role_arn} ({code}). Nothing was read or "
+                    f"changed: CloudWaste does not fall back to its own "
+                    f"credentials for customer accounts."
+                ) from exc
+            creds = response.get("Credentials") or {}
+            if not all(
+                creds.get(k) for k in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+            ):
+                raise AssumeRoleError(
+                    f"sts:AssumeRole for {role_arn} returned no usable credentials."
+                )
             session = boto3.Session(
                 aws_access_key_id=creds["AccessKeyId"],
                 aws_secret_access_key=creds["SecretAccessKey"],
                 aws_session_token=creds["SessionToken"],
                 region_name=region,
             )
-            self._cache[key] = (session, creds["Expiration"])
+            expiration = creds.get("Expiration") or (now + timedelta(minutes=15))
+            self._cache[key] = (session, expiration)
+            logger.info("assumed %s until %s", role_arn, expiration)
             return session
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
 
     def client(
         self,

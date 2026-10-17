@@ -130,6 +130,7 @@ def build_finding(
         summary=summary,
         evidence=evidence,
         detector=detector,
+        cost_source="price_book" if context.cost_is_estimated else "cost_explorer",
         action_context=action_context or {},
         scan_id=context.scan_id,
     )

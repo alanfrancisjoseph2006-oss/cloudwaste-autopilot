@@ -43,8 +43,12 @@ class S3Detector:
     def detect(self, context: DetectionContext) -> list[Finding]:
         resource = context.resource
         config = resource.configuration
-        size_gb = config.get("size_gb", 0.0)
-        object_count = config.get("object_count", 0)
+        size_gb = config.get("size_gb")
+        object_count = config.get("object_count")
+        # Unpublished storage metrics mean the size is unknown, not zero. With
+        # no size there is no saving to compute, so the bucket is not flagged.
+        if size_gb is None or object_count is None:
+            return []
 
         if size_gb < 1.0 or object_count <= 0:
             return []

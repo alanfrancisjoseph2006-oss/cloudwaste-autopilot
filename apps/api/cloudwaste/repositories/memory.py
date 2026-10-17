@@ -20,11 +20,12 @@ from ..models.domain import (
     Action,
     AuditLog,
     Finding,
+    OptimizationPlan,
     Recommendation,
     Resource,
     Scan,
 )
-from .base import KEY_FIELDS
+from .base import KEY_FIELDS, is_bare_resource_id
 
 T = TypeVar("T")
 
@@ -39,7 +40,19 @@ class MemoryRepository(Generic[T]):
     def get(self, key: str) -> T | None:
         with self._lock:
             item = self._items.get(key)
+            if item is None and self._key == "resource_key" and is_bare_resource_id(key):
+                item = self._unique_by_resource_id(key)
             return item.model_copy(deep=True) if item is not None else None
+
+    def _unique_by_resource_id(self, resource_id: str):
+        """Legacy lookup by bare AWS id.
+
+        Returns the resource only when exactly one account holds that id. If two
+        do, the id is ambiguous and the honest answer is "not found": guessing
+        would hand one account's resource to a caller acting for another.
+        """
+        matches = [i for i in self._items.values() if i.resource_id == resource_id]
+        return matches[0] if len(matches) == 1 else None
 
     def put(self, item: T) -> T:
         with self._lock:
@@ -90,10 +103,11 @@ class MemoryRepositories:
         self.actions = MemoryRepository(Action)
         self.audit = MemoryRepository(AuditLog)
         self.scans = MemoryRepository(Scan)
+        self.plans = MemoryRepository(OptimizationPlan)
 
     def clear(self) -> None:
         for repo in (
             self.accounts, self.resources, self.findings,
-            self.recommendations, self.actions, self.audit, self.scans,
+            self.recommendations, self.actions, self.audit, self.scans, self.plans,
         ):
             repo.clear()

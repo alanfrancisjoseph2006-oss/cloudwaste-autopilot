@@ -145,6 +145,21 @@ class ActivityEvent:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class DependencyFacts:
+    """What a provider could establish about a resource's relationships.
+
+    `checked` lists the categories that were actually inspected, including
+    those where nothing was found. A category absent from `checked` was not
+    looked at (or could not be), and callers must treat it as unknown -- never
+    as "no dependency".
+    """
+
+    relationships: list[dict[str, Any]] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
+    unknown: list[dict[str, str]] = field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Provider protocols
 # --------------------------------------------------------------------------
@@ -159,6 +174,14 @@ class InventoryProvider(Protocol):
     ) -> list[Resource]: ...
 
     def get_resource(self, resource_id: str) -> Resource | None: ...
+
+    def describe_dependencies(self, resource: Resource) -> DependencyFacts:
+        """Read-only relationship lookup for one resource, on demand.
+
+        Never called during a scan: it costs API calls per resource and is only
+        needed when someone is looking at a specific change.
+        """
+        ...
 
 
 @runtime_checkable
@@ -189,9 +212,13 @@ class CostProvider(Protocol):
 
     def get_cost_by_resource(
         self, resource_id: str, start: datetime, end: datetime
-    ) -> float: ...
+    ) -> float | None:
+        """None means "no resource-level billing", never "free"."""
+        ...
 
-    def get_forecast(self, days: int = 30) -> float: ...
+    def get_forecast(self, days: int = 30) -> float | None:
+        """None means "AWS has no forecast", never "$0"."""
+        ...
 
     def get_anomalies(self, start: datetime, end: datetime) -> list[CostAnomaly]: ...
 
